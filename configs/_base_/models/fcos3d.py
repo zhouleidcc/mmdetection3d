@@ -17,7 +17,9 @@ model = dict(
         start_level=1,
         add_extra_convs='on_output',
         num_outs=5,
-        relu_before_extra_convs=True),
+        relu_before_extra_convs=True,
+        upsample_cfg=dict(mode='nearest', scale_factor=2)
+        ),
     bbox_head=dict(
         type='FCOSMono3DHead',
         num_classes=10,

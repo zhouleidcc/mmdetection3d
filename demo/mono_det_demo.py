@@ -7,10 +7,10 @@ from mmdet3d.apis import (inference_mono_3d_detector, init_model,
 
 def main():
     parser = ArgumentParser()
-    parser.add_argument('image', help='image file')
-    parser.add_argument('ann', help='ann file')
-    parser.add_argument('config', help='Config file')
-    parser.add_argument('checkpoint', help='Checkpoint file')
+    parser.add_argument('--image', default='./data/nuscenes/n015-2018-07-24-11-22-45+0800__CAM_BACK__1532402927637525.jpg', help='image file')
+    parser.add_argument('--ann', default= './data/nuscenes/n015-2018-07-24-11-22-45+0800__CAM_BACK__1532402927637525_mono3d.coco.json', help='ann file')
+    parser.add_argument('--config', default='../configs/fcos3d/fcos3d_r101_caffe_fpn_gn-head_dcn_2x8_1x_nus-mono3d_finetune.py', help='Config file')
+    parser.add_argument('--checkpoint', default='../checkpoints/fcos3d_r101_caffe_fpn_gn-head_dcn_2x8_1x_nus-mono3d_finetune_20210717_095645-8d806dc2.pth', help='Checkpoint file')
     parser.add_argument(
         '--device', default='cuda:0', help='Device used for inference')
     parser.add_argument(

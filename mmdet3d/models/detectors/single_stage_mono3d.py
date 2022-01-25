@@ -108,6 +108,56 @@ class SingleStageMono3DDetector(SingleStageDetector):
                 result_dict['img_bbox2d'] = img_bbox2d
         return bbox_list
 
+    def onnx_export(self, img, img_metas, rescale=False, with_nms=True, **kwargs):
+        """Test function without test time augmentation.
+
+        Args:
+            img (torch.Tensor): input images.
+            img_metas (list[dict]): List of image information.
+
+        Returns:
+            tuple[Tensor, Tensor]: dets of shape [N, num_det, 5]
+                and class labels of shape [N, num_det].
+        """
+        print(**kwargs)
+        x = self.extract_feat(img)
+        outs = self.bbox_head(x)
+        # get origin input shape to support onnx dynamic shape
+
+        # get shape as tensor
+        img_shape = torch._shape_as_tensor(img)[2:]
+        img_metas[0]['img_shape_for_onnx'] = img_shape
+        # get pad input shape to support onnx dynamic shape for exporting
+        # `CornerNet` and `CentripetalNet`, which 'pad_shape' is used
+        # for inference
+        img_metas[0]['pad_shape_for_onnx'] = img_shape
+
+        bbox_outputs = self.bbox_head.get_bboxes(
+            *outs, img_metas, rescale=rescale)
+        if not torch.onnx.is_in_onnx_export():
+            if self.bbox_head.pred_bbox2d:
+                from mmdet.core import bbox2result
+                bbox2d_img = [
+                    bbox2result(bboxes2d, labels, self.bbox_head.num_classes)
+                    for bboxes, scores, labels, attrs, bboxes2d in bbox_outputs
+                ]
+                bbox_outputs = [bbox_outputs[0][:-1]]
+
+            bbox_img = [
+                bbox3d2result(bboxes.tensor, scores, labels, attrs)
+                for bboxes, scores, labels, attrs in bbox_outputs
+            ]
+
+            bbox_list = [dict() for i in range(len(img_metas))]
+            for result_dict, img_bbox in zip(bbox_list, bbox_img):
+                result_dict['img_bbox'] = img_bbox
+            if self.bbox_head.pred_bbox2d:
+                for result_dict, img_bbox2d in zip(bbox_list, bbox2d_img):
+                    result_dict['img_bbox2d'] = img_bbox2d
+            return bbox_list
+        else:
+            return bbox_outputs
+
     def aug_test(self, imgs, img_metas, rescale=False):
         """Test function with test time augmentation."""
         feats = self.extract_feats(imgs)

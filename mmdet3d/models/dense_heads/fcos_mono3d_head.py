@@ -5,7 +5,7 @@ from mmcv.cnn import Scale
 from mmcv.runner import force_fp32
 from torch import nn as nn
 
-from mmdet3d.core import box3d_multiclass_nms, limit_period, xywhr2xyxyr
+from mmdet3d.core import box3d_multiclass_nms, limit_period, xywhr2xyxyr, xywhr2xyxyr_2
 from mmdet.core import multi_apply
 from mmdet.models.builder import HEADS, build_loss
 from .anchor_free_mono3d_head import AnchorFreeMono3DHead
@@ -245,6 +245,17 @@ class FCOSMono3DHead(AnchorFreeMono3DHead):
             dir_cls_targets = dir_targets
         return dir_cls_targets
 
+    def get_points(self, img_metas):
+        strides = self.strides
+        x = np.array(range(1024))
+        y = np.array(range(1024))
+        xv, yv = np.meshgrid(x, y, indexing='xy')
+        grid = np.stack((xv, yv), axis=2)
+        infer_shape = np.array(img_metas[0]["batch_input_shape"])
+        feat_shapes = np.ceil(np.array([infer_shape / strid for strid in strides])).astype(np.int32)
+        points = [(grid[:feat_shapes[i, 0], :feat_shapes[i, 1]].copy() * strid + strid // 2).reshape(-1, 2).T for
+                  i, strid in enumerate(strides)]
+        return points
     @force_fp32(
         apply_to=('cls_scores', 'bbox_preds', 'dir_cls_preds', 'attr_preds',
                   'centernesses'))
@@ -511,11 +522,14 @@ class FCOSMono3DHead(AnchorFreeMono3DHead):
         """
         assert len(cls_scores) == len(bbox_preds) == len(dir_cls_preds) == \
             len(centernesses) == len(attr_preds)
-        num_levels = len(cls_scores)
-
-        featmap_sizes = [featmap.size()[-2:] for featmap in cls_scores]
-        mlvl_points = self.get_points(featmap_sizes, bbox_preds[0].dtype,
-                                      bbox_preds[0].device)
+        num_levels = len(self.strides)
+        points = self.get_points(img_metas)
+        # mlvl_points = self.get_points(featmap_sizes, bbox_preds[0].dtype, bbox_preds[0].device)
+        # mlvl_points = [bbox_preds[0].new_tensor(point) for point in points]
+        # diffs = [mp - mpn for mp, mpn in zip(mlvl_points, mlvl_points_n)]
+        # for diff in diffs:
+        #     diff = diff.detach().cpu().numpy()
+        #     print(diff.max(), ' ', diff.min())
         result_list = []
         for img_id in range(len(img_metas)):
             cls_score_list = [
@@ -552,7 +566,7 @@ class FCOSMono3DHead(AnchorFreeMono3DHead):
             input_meta = img_metas[img_id]
             det_bboxes = self._get_bboxes_single(
                 cls_score_list, bbox_pred_list, dir_cls_pred_list,
-                attr_pred_list, centerness_pred_list, mlvl_points, input_meta,
+                attr_pred_list, centerness_pred_list, points, input_meta,
                 cfg, rescale)
             result_list.append(det_bboxes)
         return result_list
@@ -601,40 +615,57 @@ class FCOSMono3DHead(AnchorFreeMono3DHead):
         mlvl_dir_scores = []
         mlvl_attr_scores = []
         mlvl_centerness = []
-
+        NumPoints = 0
         for cls_score, bbox_pred, dir_cls_pred, attr_pred, centerness, \
                 points in zip(cls_scores, bbox_preds, dir_cls_preds,
                               attr_preds, centernesses, mlvl_points):
             assert cls_score.size()[-2:] == bbox_pred.size()[-2:]
-            scores = cls_score.permute(1, 2, 0).reshape(
-                -1, self.cls_out_channels).sigmoid()
-            dir_cls_pred = dir_cls_pred.permute(1, 2, 0).reshape(-1, 2)
-            dir_cls_score = torch.max(dir_cls_pred, dim=-1)[1]
-            attr_pred = attr_pred.permute(1, 2, 0).reshape(-1, self.num_attrs)
-            attr_score = torch.max(attr_pred, dim=-1)[1]
-            centerness = centerness.permute(1, 2, 0).reshape(-1).sigmoid()
+            scores = cls_score.reshape(self.cls_out_channels, -1).sigmoid()
+            dir_cls_pred = dir_cls_pred.reshape(2, -1)
+            dir_cls_score = torch.max(dir_cls_pred, dim=0)[1]
+            attr_pred = attr_pred.reshape(self.num_attrs, -1)
+            attr_score = torch.max(attr_pred, dim=0)[1]
+            centerness = centerness.reshape(-1).sigmoid()
+            bbox_pred = bbox_pred.reshape(sum(self.group_reg_dims), -1)
+            bbox_pred = bbox_pred[:self.bbox_code_size, :]
 
-            bbox_pred = bbox_pred.permute(1, 2,
-                                          0).reshape(-1,
-                                                     sum(self.group_reg_dims))
-            bbox_pred = bbox_pred[:, :self.bbox_code_size]
+            # points = points.permute(1, 0)
+            # scores = cls_score.permute(1, 2, 0).reshape(
+            #     -1, self.cls_out_channels).sigmoid()
+            # dir_cls_pred = dir_cls_pred.permute(1, 2, 0).reshape(-1, 2)
+            # dir_cls_score = torch.max(dir_cls_pred, dim=-1)[1]
+            # attr_pred = attr_pred.permute(1, 2, 0).reshape(-1, self.num_attrs)
+            # attr_score = torch.max(attr_pred, dim=-1)[1]
+            # centerness = centerness.permute(1, 2, 0).reshape(-1).sigmoid()
+            #
+            # bbox_pred = bbox_pred.permute(1, 2, 0).reshape(-1, sum(self.group_reg_dims))
+            # bbox_pred = bbox_pred[:, :self.bbox_code_size]
+
+            numpoint = points.shape[1]
+            points = bbox_pred.new_tensor(points)
             nms_pre = cfg.get('nms_pre', -1)
-            if nms_pre > 0 and scores.shape[0] > nms_pre:
-                max_scores, _ = (scores * centerness[:, None]).max(dim=1)
+            if nms_pre > 0 and numpoint > nms_pre and not torch.onnx.is_in_onnx_export():
+                max_scores, _ = (scores * centerness[None, :]).max(dim=0)
                 _, topk_inds = max_scores.topk(nms_pre)
-                points = points[topk_inds, :]
-                bbox_pred = bbox_pred[topk_inds, :]
-                scores = scores[topk_inds, :]
-                dir_cls_pred = dir_cls_pred[topk_inds, :]
+                points = points[:, topk_inds]
+                bbox_pred = bbox_pred[:, topk_inds]
+                scores = scores[:, topk_inds]
+                dir_cls_pred = dir_cls_pred[:, topk_inds]
                 centerness = centerness[topk_inds]
                 dir_cls_score = dir_cls_score[topk_inds]
                 attr_score = attr_score[topk_inds]
+                numpoint = nms_pre
+
+
+
             # change the offset to actual center predictions
-            bbox_pred[:, :2] = points - bbox_pred[:, :2]
+
+            NumPoints += numpoint
+            bbox_pred[:2, :] = points - bbox_pred[:2, :]
             if rescale:
-                bbox_pred[:, :2] /= bbox_pred[:, :2].new_tensor(scale_factor)
-            pred_center2d = bbox_pred[:, :3].clone()
-            bbox_pred[:, :3] = self.pts2Dto3D(bbox_pred[:, :3], view)
+                bbox_pred[2:, :] /= bbox_pred[2:, :].new_tensor(scale_factor)
+            pred_center2d = bbox_pred[:3, :].clone()
+            bbox_pred[:3, :] = self.pts2Dto3D(bbox_pred[:3, :], view, numpoint)
             mlvl_centers2d.append(pred_center2d)
             mlvl_bboxes.append(bbox_pred)
             mlvl_scores.append(scores)
@@ -642,86 +673,103 @@ class FCOSMono3DHead(AnchorFreeMono3DHead):
             mlvl_attr_scores.append(attr_score)
             mlvl_centerness.append(centerness)
 
-        mlvl_centers2d = torch.cat(mlvl_centers2d)
-        mlvl_bboxes = torch.cat(mlvl_bboxes)
+        mlvl_centers2d = torch.cat(mlvl_centers2d, dim=1)
+        mlvl_bboxes = torch.cat(mlvl_bboxes, dim=1)
         mlvl_dir_scores = torch.cat(mlvl_dir_scores)
 
         # change local yaw to global yaw for 3D nms
-        if mlvl_bboxes.shape[0] > 0:
-            dir_rot = limit_period(mlvl_bboxes[..., 6] - self.dir_offset, 0,
+        if NumPoints > 0:
+            dir_rot = limit_period(mlvl_bboxes[6, ...] - self.dir_offset, 0,
                                    np.pi)
-            mlvl_bboxes[..., 6] = (
+            mlvl_bboxes[6, ...] = (
                 dir_rot + self.dir_offset +
                 np.pi * mlvl_dir_scores.to(mlvl_bboxes.dtype))
-
         cam_intrinsic = mlvl_centers2d.new_zeros((4, 4))
         cam_intrinsic[:view.shape[0], :view.shape[1]] = \
             mlvl_centers2d.new_tensor(view)
-        mlvl_bboxes[:, 6] = torch.atan2(
-            mlvl_centers2d[:, 0] - cam_intrinsic[0, 2],
-            cam_intrinsic[0, 0]) + mlvl_bboxes[:, 6]
-        mlvl_bboxes_for_nms = xywhr2xyxyr(input_meta['box_type_3d'](
-            mlvl_bboxes, box_dim=self.bbox_code_size,
-            origin=(0.5, 0.5, 0.5)).bev)
+        tsin = mlvl_centers2d[0, :] - cam_intrinsic[0, 2]
+        tcos = cam_intrinsic[0, 0] + 1.0e-6
 
-        mlvl_scores = torch.cat(mlvl_scores)
-        padding = mlvl_scores.new_zeros(mlvl_scores.shape[0], 1)
+        alphas = torch.atan(tsin / tcos)
+        cos_pos = torch.nn.functional.relu(tcos).to(torch.bool).to(dtype=tcos.dtype)
+        sin_pos = torch.nn.functional.relu(tsin).to(torch.bool).to(dtype=tsin.dtype)
+        cos_neg = 1.0 - cos_pos
+        sin_neg = 1.0 - sin_pos
+        sign = (sin_neg * cos_neg + sin_pos * cos_neg) * 3.1415926
+        alphas = alphas + sign
+        mlvl_bboxes[6, :] = alphas + mlvl_bboxes[6, :]
+        mlvl_scores = torch.cat(mlvl_scores, dim=1)
+        padding = mlvl_scores.new_zeros(1, NumPoints)
         # remind that we set FG labels to [0, num_class-1] since mmdet v2.0
         # BG cat_id: num_class
-        mlvl_scores = torch.cat([mlvl_scores, padding], dim=1)
+        mlvl_scores = torch.cat([mlvl_scores, padding], dim=0)
         mlvl_attr_scores = torch.cat(mlvl_attr_scores)
         mlvl_centerness = torch.cat(mlvl_centerness)
         # no scale_factors in box3d_multiclass_nms
         # Then we multiply it from outside
-        mlvl_nms_scores = mlvl_scores * mlvl_centerness[:, None]
-        results = box3d_multiclass_nms(mlvl_bboxes, mlvl_bboxes_for_nms,
-                                       mlvl_nms_scores, cfg.score_thr,
-                                       cfg.max_per_img, cfg, mlvl_dir_scores,
-                                       mlvl_attr_scores)
-        bboxes, scores, labels, dir_scores, attrs = results
-        attrs = attrs.to(labels.dtype)  # change data type to int
-        bboxes = input_meta['box_type_3d'](
-            bboxes, box_dim=self.bbox_code_size, origin=(0.5, 0.5, 0.5))
-        # Note that the predictions use origin (0.5, 0.5, 0.5)
-        # Due to the ground truth centers2d are the gravity center of objects
-        # v0.10.0 fix inplace operation to the input tensor of cam_box3d
-        # So here we also need to add origin=(0.5, 0.5, 0.5)
-        if not self.pred_attrs:
-            attrs = None
+        mlvl_nms_scores = mlvl_scores * mlvl_centerness[None, :]
 
-        return bboxes, scores, labels, attrs
+        if not torch.onnx.is_in_onnx_export():
+            mlvl_bboxes = mlvl_bboxes.permute(1, 0)
+            mlvl_bboxes_for_nms = xywhr2xyxyr(input_meta['box_type_3d'](
+                mlvl_bboxes, box_dim=self.bbox_code_size,
+                origin=(0.5, 0.5, 0.5)).bev)
+
+
+            mlvl_nms_scores = mlvl_nms_scores.permute(1, 0)
+            results = box3d_multiclass_nms(mlvl_bboxes, mlvl_bboxes_for_nms,
+                                           mlvl_nms_scores, cfg.score_thr,
+                                           cfg.max_per_img, cfg, mlvl_dir_scores,
+                                           mlvl_attr_scores)
+            bboxes, scores, labels, dir_scores, attrs = results
+            attrs = attrs.to(labels.dtype)  # change data type to int
+            bboxes = input_meta['box_type_3d'](
+                bboxes, box_dim=self.bbox_code_size, origin=(0.5, 0.5, 0.5))
+            # Note that the predictions use origin (0.5, 0.5, 0.5)
+            # Due to the ground truth centers2d are the gravity center of objects
+            # v0.10.0 fix inplace operation to the input tensor of cam_box3d
+            # So here we also need to add origin=(0.5, 0.5, 0.5)
+            if not self.pred_attrs:
+                attrs = None
+
+            return bboxes, scores, labels, attrs
+        else:
+            dst = mlvl_bboxes.new_tensor(np.array([0.5, 1.0, 0.5]).astype(np.float32).reshape(3, 1))
+            src = mlvl_bboxes.new_tensor(np.array([0.5, 0.5, 0.5]).astype(np.float32).reshape(3, 1))
+            mlvl_bboxes[:3, :] += mlvl_bboxes[3:6, :] * (dst - src)
+            mlvl_bboxes_for_nms = xywhr2xyxyr_2(mlvl_bboxes[[0, 2, 3, 5, 6], :])
+            return mlvl_bboxes, mlvl_nms_scores, mlvl_bboxes_for_nms, mlvl_dir_scores, mlvl_attr_scores
+            # return mlvl_bboxes, mlvl_nms_scores, mlvl_dir_scores, mlvl_attr_scores
 
     @staticmethod
-    def pts2Dto3D(points, view):
+    def pts2Dto3D(points, view, N):
         """
         Args:
-            points (torch.Tensor): points in 2D images, [N, 3], \
+            points (torch.Tensor): points in 2D images, [3, N], \
                 3 corresponds with x, y in the image and depth.
             view (np.ndarray): camera instrinsic, [3, 3]
 
         Returns:
-            torch.Tensor: points in 3D space. [N, 3], \
+            torch.Tensor: points in 3D space. [3, N], \
                 3 corresponds with x, y, z in 3D space.
         """
         assert view.shape[0] <= 4
         assert view.shape[1] <= 4
-        assert points.shape[1] == 3
+        assert points.shape[0] == 3
+        points2D = points[:2, :]
+        depths = points[2:3, :]
+        unnorm_points2D = torch.cat([points2D * depths, depths], dim=0)
 
-        points2D = points[:, :2]
-        depths = points[:, 2].view(-1, 1)
-        unnorm_points2D = torch.cat([points2D * depths, depths], dim=1)
-
-        viewpad = torch.eye(4, dtype=points2D.dtype, device=points2D.device)
-        viewpad[:view.shape[0], :view.shape[1]] = points2D.new_tensor(view)
-        inv_viewpad = torch.inverse(viewpad).transpose(0, 1)
-
+        view_m = np.eye(4).astype(np.float32)
+        view_m[:3, :3] = view.copy()
+        view_m = np.linalg.pinv(view_m)
+        view_m = points2D.new_tensor(view_m)
         # Do operation in homogenous coordinates.
-        nbr_points = unnorm_points2D.shape[0]
         homo_points2D = torch.cat(
             [unnorm_points2D,
-             points2D.new_ones((nbr_points, 1))], dim=1)
-        points3D = torch.mm(homo_points2D, inv_viewpad)[:, :3]
-
+             points2D.new_ones((1, N))], dim=0)
+        points3D = torch.mm(view_m, homo_points2D)[:3, :]
+        #here torch.mm returns nan at some time with float16
         return points3D
 
     def _get_points_single(self,

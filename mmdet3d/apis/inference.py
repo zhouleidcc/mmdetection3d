@@ -248,6 +248,8 @@ def inference_mono_3d_detector(model, image, ann_file):
 
     # forward the model
     with torch.no_grad():
+        model.fp16_enabled = True
+        data['img'][0].half()
         result = model(return_loss=False, rescale=True, **data)
     return result, data
 
